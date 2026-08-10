@@ -10,7 +10,7 @@
 Требуется **Keenetic + Entware + AWG Manager**.
 
 ```sh
-wget -O /opt/tmp/awg-manager-tunnel-access.sh https://raw.githubusercontent.com/genaRijoff/awgm_tun_wgX/main/awg-manager-tunnel-access.sh
+wget --no-check-certificate -O /opt/tmp/awg-manager-tunnel-access.sh https://raw.githubusercontent.com/genaRijoff/awgm_tun_wgX/main/awg-manager-tunnel-access.sh
 chmod +x /opt/tmp/awg-manager-tunnel-access.sh
 /opt/tmp/awg-manager-tunnel-access.sh
 ```
