@@ -4,13 +4,19 @@
 # Russian interface
 #
 # Purpose:
-#   Give AWG Manager :2222 access through a selected Keenetic WireGuard
+#   Give AWG Manager access through a selected Keenetic WireGuard
 #   interface and provide a reliable rollback to the exact saved state.
 #
 # Requirements:
 #   - KeeneticOS with ndmc
 #   - Entware
+#   - jq (opkg install jq)
 #   - AWG Manager with /opt/etc/awg-manager/settings.json
+#
+# JSON layout this script edits (verified on schemaVersion 32):
+#   .server.interfaces  -> array, e.g. ["br0"]
+#   .server.port        -> number
+#   .server.interface   -> NOT touched by this script (single primary iface)
 #
 # Run as root.
 #
@@ -19,6 +25,12 @@ PATH="/opt/bin:/opt/sbin:/bin:/sbin:/usr/bin:/usr/sbin:$PATH"
 
 AWG_SETTINGS="/opt/etc/awg-manager/settings.json"
 AWG_INIT="/opt/etc/init.d/S99awg-manager"
+AWG_PKG="awg-manager"
+# HTTP, а не HTTPS: официальная инструкция AWG Manager использует именно
+# http://repo.hoaxisr.ru/install.sh, так как busybox wget на многих
+# прошивках Keenetic не умеет TLS. Это только текст подсказки при ошибке
+# (скрипт больше не выполняет установку сам), поэтому безопасно.
+AWG_INSTALL_URL="http://repo.hoaxisr.ru/install.sh"
 BACKUP_ROOT="/opt/etc/awg-manager/.tunnel-access-backup"
 STATE_FILE="$BACKUP_ROOT/state.tsv"
 FULL_SETTINGS="$BACKUP_ROOT/settings.json"
@@ -30,40 +42,106 @@ die() { say "ОШИБКА: $*" >&2; exit 1; }
 cleanup() { rm -f "$LOCK_FILE"; }
 trap cleanup EXIT INT TERM
 
+# ---------------------------------------------------------------------------
+# Preconditions
+# ---------------------------------------------------------------------------
+
 [ "$(id -u 2>/dev/null)" = "0" ] || die "скрипт нужно запускать от root"
+command -v opkg >/dev/null 2>&1 || die "не найден opkg (нужен Entware)"
+command -v jq >/dev/null 2>&1 || die "не найден jq (opkg install jq)"
+command -v ndmc >/dev/null 2>&1 || die "не найден ndmc"
+
+# Stale-lock aware locking: store PID, verify liveness on collision.
+if [ -e "$LOCK_FILE" ]; then
+    old_pid="$(cat "$LOCK_FILE" 2>/dev/null)"
+    if [ -n "$old_pid" ] && kill -0 "$old_pid" 2>/dev/null; then
+        die "скрипт уже выполняется (pid $old_pid)"
+    else
+        say "Найден протухший lock-файл (pid $old_pid не активен) — снимаю."
+        rm -f "$LOCK_FILE"
+    fi
+fi
+printf '%s\n' "$$" > "$LOCK_FILE"
+
+# Этот скрипт не устанавливает и не обновляет AWG Manager — это отдельная
+# задача. Здесь только проверка, что пакет установлен и рабочий.
+if ! opkg list-installed 2>/dev/null | grep -q "^$AWG_PKG - "; then
+    die "AWG Manager не установлен. Установка: wget -qO- $AWG_INSTALL_URL | sh"
+fi
+
 [ -f "$AWG_SETTINGS" ] || die "не найден $AWG_SETTINGS"
 [ -x "$AWG_INIT" ] || die "не найден $AWG_INIT"
 
-if [ -e "$LOCK_FILE" ]; then
-    die "скрипт уже выполняется"
-fi
-: > "$LOCK_FILE"
+jq empty "$AWG_SETTINGS" 2>/dev/null || die "$AWG_SETTINGS повреждён (невалидный JSON)"
 
 ndmc_cmd() {
     ndmc -c "$1" 2>/dev/null
 }
 
-# Extract a value from: "key": value / key: value
-json_string() {
-    key="$1"
-    file="$2"
-    sed -n 's/^[[:space:]]*"'"$key"'":[[:space:]]*"\([^"]*\)".*/\1/p' "$file" | head -n 1
-}
-
-json_number() {
-    key="$1"
-    file="$2"
-    sed -n 's/^[[:space:]]*"'"$key"'":[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$file" | head -n 1
-}
+# ---------------------------------------------------------------------------
+# jq helpers — all reads/writes of settings.json go through these
+# ---------------------------------------------------------------------------
 
 get_server_port() {
-    p=$(json_number port "$AWG_SETTINGS")
-    [ -n "$p" ] && printf '%s\n' "$p" || printf '2222\n'
+    p="$(jq -r '.server.port // empty' "$AWG_SETTINGS" 2>/dev/null)"
+    case "$p" in
+        ''|*[!0-9]*) printf '2222\n' ;;
+        *) printf '%s\n' "$p" ;;
+    esac
 }
 
-# Read WireGuard interfaces from Keenetic CLI.
-# We intentionally use CLI names Wireguard0, Wireguard1, ... rather than
-# Linux names nwg0, nwg1, ... .
+# Returns 0 (true) if iface is already present in .server.interfaces
+interface_present() {
+    iface="$1"
+    jq -e --arg i "$iface" '.server.interfaces | index($i) != null' \
+        "$AWG_SETTINGS" >/dev/null 2>&1
+}
+
+# Atomically add an interface to .server.interfaces (no-op if present).
+add_interface_to_awg() {
+    linux="$1"
+
+    if interface_present "$linux"; then
+        return 0
+    fi
+
+    tmp="/tmp/awg-settings.$$.json"
+    jq --arg i "$linux" \
+       '.server.interfaces = ((.server.interfaces // []) + [$i] | unique)' \
+       "$AWG_SETTINGS" > "$tmp" 2>/dev/null
+
+    [ -s "$tmp" ] || { rm -f "$tmp"; die "jq вернул пустой результат при добавлении $linux"; }
+    jq empty "$tmp" 2>/dev/null || { rm -f "$tmp"; die "jq сгенерировал невалидный JSON"; }
+
+    if ! jq -e --arg i "$linux" '.server.interfaces | index($i) != null' "$tmp" >/dev/null 2>&1; then
+        rm -f "$tmp"
+        die "не удалось добавить $linux в .server.interfaces"
+    fi
+
+    mv "$tmp" "$AWG_SETTINGS" || die "не удалось сохранить settings.json"
+}
+
+# Atomically remove an interface from .server.interfaces (no-op if absent).
+remove_interface_from_awg() {
+    linux="$1"
+
+    interface_present "$linux" || return 0
+
+    tmp="/tmp/awg-settings.$$.json"
+    jq --arg i "$linux" \
+       '.server.interfaces = ((.server.interfaces // []) - [$i])' \
+       "$AWG_SETTINGS" > "$tmp" 2>/dev/null
+
+    [ -s "$tmp" ] || { rm -f "$tmp"; die "jq вернул пустой результат при удалении $linux"; }
+    jq empty "$tmp" 2>/dev/null || { rm -f "$tmp"; die "jq сгенерировал невалидный JSON"; }
+
+    mv "$tmp" "$AWG_SETTINGS" || die "не удалось сохранить settings.json"
+}
+
+# ---------------------------------------------------------------------------
+# WireGuard interface discovery (Keenetic CLI side)
+# ---------------------------------------------------------------------------
+
 list_wg_interfaces() {
     i=0
     while [ "$i" -lt 64 ]; do
@@ -112,16 +190,9 @@ show_wg_list() {
     fi
 
     say ""
-    say "Доступные WireGuard:"
-    say ""
-    n=1
+    say "WireGuard:"
     while IFS="$(printf '\t')" read -r name ip desc sec state link; do
-        printf '%s) %s\n' "$n" "$name"
-        printf '   IP: %s\n' "$ip"
-        printf '   Описание: %s\n' "$desc"
-        printf '   Security: %s\n' "$sec"
-        printf '   State: %s / Link: %s\n' "$state" "$link"
-        n=$((n + 1))
+        printf '  %-11s %-15s %-9s %s (%s/%s)\n' "$name" "$ip" "$sec" "$desc" "$state" "$link"
     done < "$TMP"
     rm -f "$TMP"
 }
@@ -173,6 +244,10 @@ select_wg() {
     return 0
 }
 
+# ---------------------------------------------------------------------------
+# Backup / restore
+# ---------------------------------------------------------------------------
+
 ensure_backup() {
     mkdir -p "$BACKUP_ROOT" || die "не удалось создать $BACKUP_ROOT"
 
@@ -181,83 +256,24 @@ ensure_backup() {
         cp -p "$AWG_SETTINGS" "$FULL_SETTINGS" || die "не удалось сохранить settings.json"
     fi
 
-    # Store the original security level per interface only once.
-    if [ ! -f "$STATE_FILE" ]; then
-        : > "$STATE_FILE"
-    fi
+    [ -f "$STATE_FILE" ] || : > "$STATE_FILE"
 
     if ! grep -q "^$SEL_NAME	" "$STATE_FILE" 2>/dev/null; then
+        # Append atomically: write to tmp, then replace.
+        tmp="/tmp/awg-state.$$.tsv"
+        cp -p "$STATE_FILE" "$tmp" 2>/dev/null || : > "$tmp"
         printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
             "$SEL_NAME" "$SEL_IP" "$SEL_SEC" "$SEL_LINUX" "$SEL_DESC" \
-            "$(date '+%Y-%m-%d %H:%M:%S')" >> "$STATE_FILE"
+            "$(date '+%Y-%m-%d %H:%M:%S')" >> "$tmp"
+        mv "$tmp" "$STATE_FILE" || die "не удалось обновить $STATE_FILE"
     fi
 }
 
-add_interface_to_awg() {
-    linux="$1"
-
-    # Already present?
-    if grep -q '"'"$linux"'"' "$AWG_SETTINGS"; then
-        return 0
-    fi
-
-    # The usual AWG Manager JSON layout is:
-    # "interfaces": [
-    #   "br0"
-    # ]
-    #
-    # Insert before the closing ] of the interfaces array only.
-    tmp="/tmp/awg-settings.$$"
-    awk -v add="$linux" '
-        BEGIN { in_if=0; done=0 }
-        /"interfaces"[[:space:]]*:[[:space:]]*\[/ {
-            in_if=1
-            print
-            next
-        }
-        in_if && /^[[:space:]]*\][[:space:]]*,?[[:space:]]*$/ && !done {
-            # If the previous element exists, add a comma to it.
-            if (last ~ /"[^"]+"/) {
-                sub(/[[:space:]]*,?[[:space:]]*$/, ",", last)
-                print last
-            }
-            printf "      \"%s\"\n", add
-            print
-            done=1
-            in_if=0
-            next
-        }
-        in_if {
-            if (last != "") print last
-            last=$0
-            next
-        }
-        { print }
-        END {
-            if (in_if && !done) {
-                if (last != "") print last
-                printf "      \"%s\"\n", add
-                print "    ]"
-            }
-        }
-    ' "$AWG_SETTINGS" > "$tmp" || {
-        rm -f "$tmp"
-        die "не удалось изменить settings.json"
-    }
-
-    # Validate that the requested interface was inserted.
-    grep -q '"'"$linux"'"' "$tmp" || {
-        rm -f "$tmp"
-        die "не удалось добавить $linux в interfaces"
-    }
-
-    mv "$tmp" "$AWG_SETTINGS" || die "не удалось сохранить settings.json"
-}
-
-set_security_private() {
+set_security_level() {
     iface="$1"
-    ndmc_cmd "interface $iface security-level private" >/dev/null || \
-        die "не удалось установить security-level private для $iface"
+    level="$2"
+    ndmc_cmd "interface $iface security-level $level" >/dev/null || \
+        die "не удалось установить security-level $level для $iface"
 }
 
 save_keenetic() {
@@ -273,12 +289,43 @@ restart_awg() {
     return 0
 }
 
-check_port() {
+port_is_listening() {
     ipaddr="$1"
     port="$2"
-    netstat -lnpt 2>/dev/null | grep -q "${ipaddr}:${port}[[:space:]]" && return 0
+    netstat -lnpt 2>/dev/null | grep -q "${ipaddr}:${port}[[:space:]]"
+}
+
+# Ждёт до $max_wait секунд, пока AWG Manager не начнёт слушать порт.
+# После рестарта демону нужно время на инициализацию — мгновенная
+# однократная проверка часто ловит ложное "не найдено".
+wait_for_port() {
+    ipaddr="$1"
+    port="$2"
+    max_wait=10
+
+    if ! command -v netstat >/dev/null 2>&1; then
+        say "ПРЕДУПРЕЖДЕНИЕ: netstat недоступен, проверка порта пропущена."
+        return 2
+    fi
+
+    say "Проверка порта..."
+    elapsed=0
+    while [ "$elapsed" -lt "$max_wait" ]; do
+        if port_is_listening "$ipaddr" "$port"; then
+            return 0
+        fi
+        elapsed=$((elapsed + 1))
+        say "  $elapsed секунд..."
+        sleep 1
+    done
+
+    port_is_listening "$ipaddr" "$port" && return 0
     return 1
 }
+
+# ---------------------------------------------------------------------------
+# Main actions
+# ---------------------------------------------------------------------------
 
 configure_access() {
     select_wg || return 0
@@ -314,11 +361,11 @@ configure_access() {
     # Backup current settings too, for diagnostics.
     cp -p "$AWG_SETTINGS" "$BACKUP_ROOT/settings.before.$SEL_NAME.json" 2>/dev/null
 
-    say "[1/4] Добавляю $SEL_LINUX в AWG Manager..."
+    say "[1/4] Добавляю $SEL_LINUX в AWG Manager (.server.interfaces)..."
     add_interface_to_awg "$SEL_LINUX"
 
     say "[2/4] Устанавливаю $SEL_NAME = private..."
-    set_security_private "$SEL_NAME"
+    set_security_level "$SEL_NAME" "private"
 
     say "[3/4] Сохраняю конфигурацию Keenetic..."
     save_keenetic
@@ -328,13 +375,13 @@ configure_access() {
 
     port="$(get_server_port)"
     say ""
-    say "Проверка:"
-    if check_port "$SEL_IP" "$port"; then
-        say "OK: AWG Manager слушает $SEL_IP:$port"
-    else
-        say "ПРЕДУПРЕЖДЕНИЕ: $SEL_IP:$port пока не обнаружен в LISTEN."
-        say "Проверь: netstat -lnpt | grep $port"
-    fi
+    wait_for_port "$SEL_IP" "$port"
+    case "$?" in
+        0) say "OK: AWG Manager слушает $SEL_IP:$port" ;;
+        1) say "ПРЕДУПРЕЖДЕНИЕ: $SEL_IP:$port не обнаружен в LISTEN за 10 секунд."
+           say "Проверь: netstat -lnpt | grep $port" ;;
+        2) : ;; # already warned inside wait_for_port
+    esac
 
     say ""
     say "Адрес AWG Manager:"
@@ -364,8 +411,11 @@ restore_all() {
         *) say "Отменено."; return 0 ;;
     esac
 
+    fail_count=0
+
     # Restore exact original AWG settings.
     if [ -f "$FULL_SETTINGS" ]; then
+        jq empty "$FULL_SETTINGS" 2>/dev/null || die "резервный settings.json повреждён, откат остановлен"
         cp -p "$FULL_SETTINGS" "$AWG_SETTINGS" || die "не удалось восстановить settings.json"
         say "[+] settings.json восстановлен"
     fi
@@ -377,8 +427,10 @@ restore_all() {
             [ -n "$oldsec" ] || continue
 
             say "[+] $iface -> security-level $oldsec"
-            ndmc_cmd "interface $iface security-level $oldsec" >/dev/null || \
+            if ! ndmc_cmd "interface $iface security-level $oldsec" >/dev/null; then
                 say "    ПРЕДУПРЕЖДЕНИЕ: не удалось восстановить $iface"
+                fail_count=$((fail_count + 1))
+            fi
         done < "$STATE_FILE"
     fi
 
@@ -389,35 +441,52 @@ restore_all() {
     restart_awg
 
     say ""
-    say "Откат завершён."
-    say "Резервная копия НЕ удалена:"
-    say "  $BACKUP_ROOT"
+    if [ "$fail_count" -gt 0 ]; then
+        say "Откат завершён С ОШИБКАМИ ($fail_count интерфейс(ов) не восстановлены)."
+        say "Проверь вручную: ndmc -c \"show interface WireguardN\""
+        say "Резервная копия НЕ удалена (нужна для повторной попытки):"
+        say "  $BACKUP_ROOT"
+    else
+        say "Откат завершён."
+        # Полный успех: точка отката больше не актуальна для будущих
+        # запусков — снимаем её, чтобы следующий configure_access() снял
+        # свежий снапшот текущего (уже восстановленного) состояния, а не
+        # унаследовал точку отката от самого первого запуска скрипта.
+        rm -f "$FULL_SETTINGS" "$STATE_FILE"
+        rm -f "$BACKUP_ROOT"/settings.before.*.json 2>/dev/null
+        say "Точка отката снята — при следующей настройке будет создана заново."
+    fi
 }
 
 show_status() {
     port="$(get_server_port)"
+
     say ""
-    say "=== Текущее состояние ==="
-    say ""
+    say "=== Состояние ==="
     show_wg_list
 
     say ""
-    say "AWG Manager:"
-    say "  Порт: $port"
+    say "AWG Manager: порт $port, interfaces $(jq -c '.server.interfaces' "$AWG_SETTINGS" 2>/dev/null)"
 
-    if netstat -lnpt 2>/dev/null | grep -q ":$port[[:space:]]"; then
-        netstat -lnpt 2>/dev/null | grep ":$port[[:space:]]"
+    if command -v netstat >/dev/null 2>&1; then
+        listen="$(netstat -lnpt 2>/dev/null | awk -v p=":$port" '$4 ~ p"$" {print $4}')"
+        if [ -n "$listen" ]; then
+            say "  LISTEN: $(printf '%s' "$listen" | tr '\n' ' ')"
+        else
+            say "  LISTEN на порту $port не найден"
+        fi
     else
-        say "  LISTEN на порту $port не найден"
+        say "  (netstat недоступен)"
     fi
 
     say ""
     if [ -f "$STATE_FILE" ]; then
-        say "Точка отката существует:"
-        say "  $BACKUP_ROOT"
-        say ""
+        say "Точка отката: $BACKUP_ROOT"
         say "Изменённые интерфейсы:"
-        cat "$STATE_FILE"
+        while IFS="$(printf '\t')" read -r iface ip oldsec linux desc ts; do
+            [ -n "$iface" ] || continue
+            printf '  %-11s было: %-8s %s (%s)\n' "$iface" "$oldsec" "$linux" "$ts"
+        done < "$STATE_FILE"
     else
         say "Точка отката отсутствует."
     fi
