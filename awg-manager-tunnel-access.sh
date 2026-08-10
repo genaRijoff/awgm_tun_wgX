@@ -253,6 +253,20 @@ ensure_backup() {
 
     # Create the original snapshot only once. This is the rollback point.
     if [ ! -f "$FULL_SETTINGS" ]; then
+        extra="$(jq -r '.server.interfaces // [] | map(select(. != "br0")) | .[]' "$AWG_SETTINGS" 2>/dev/null)"
+        if [ -n "$extra" ]; then
+            say ""
+            say "ВНИМАНИЕ: в settings.json уже есть интерфейсы, кроме br0:"
+            printf '%s\n' "$extra" | while IFS= read -r e; do say "  - $e"; done
+            say "Это состояние будет сохранено как точка отката (\"исходное\")."
+            say "Если это не так — сначала поправь settings.json/security-level вручную."
+            printf "Продолжить и считать текущее состояние исходным? [y/N]: "
+            read confirm_extra
+            case "$confirm_extra" in
+                y|Y|д|Д) ;;
+                *) die "Отменено пользователем." ;;
+            esac
+        fi
         cp -p "$AWG_SETTINGS" "$FULL_SETTINGS" || die "не удалось сохранить settings.json"
     fi
 
