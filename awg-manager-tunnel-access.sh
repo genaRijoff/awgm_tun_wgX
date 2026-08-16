@@ -18,12 +18,22 @@
 #   .server.port        -> number
 #   .server.interface   -> NOT touched by this script (single primary iface)
 #
+# ndmc output format:
+#   Разные сборки KeeneticOS отдают "show interface X" либо текстом
+#   (key: value), либо JSON. Формат определяется один раз при старте
+#   (ndmc_preflight) и парсер выбирается соответственно.
+#
 # Run as root.
 #
 
 PATH="/opt/bin:/opt/sbin:/bin:/sbin:/usr/bin:/usr/sbin:$PATH"
 
+# settings.json содержит приватные ключи — временные файлы создаём
+# только с правами владельца.
+umask 077
+
 AWG_SETTINGS="/opt/etc/awg-manager/settings.json"
+AWG_DIR="/opt/etc/awg-manager"
 AWG_INIT="/opt/etc/init.d/S99awg-manager"
 AWG_PKG="awg-manager"
 # HTTP, а не HTTPS: официальная инструкция AWG Manager использует именно
@@ -31,16 +41,30 @@ AWG_PKG="awg-manager"
 # прошивках Keenetic не умеет TLS. Это только текст подсказки при ошибке
 # (скрипт больше не выполняет установку сам), поэтому безопасно.
 AWG_INSTALL_URL="http://repo.hoaxisr.ru/install.sh"
-BACKUP_ROOT="/opt/etc/awg-manager/.tunnel-access-backup"
+BACKUP_ROOT="$AWG_DIR/.tunnel-access-backup"
 STATE_FILE="$BACKUP_ROOT/state.tsv"
 FULL_SETTINGS="$BACKUP_ROOT/settings.json"
 LOCK_FILE="/tmp/awg-manager-tunnel-access.lock"
 
-say() { printf '%s\n' "$*"; }
-die() { say "ОШИБКА: $*" >&2; exit 1; }
+MAX_WG_INDEX=63
+PORT_WAIT_SECONDS=10
 
-cleanup() { rm -f "$LOCK_FILE"; }
-trap cleanup EXIT INT TERM
+TMP_LIST="/tmp/awg-wg-list.$$"
+TMP_SETTINGS="$AWG_DIR/.settings.tmp.$$"
+TMP_STATE="$BACKUP_ROOT/.state.tmp.$$"
+
+NDMC_FORMAT=""      # json | text, определяется в ndmc_preflight
+LOCK_OWNED=0
+
+say() { printf '%s\n' "$*"; }
+warn() { printf '%s\n' "$*" >&2; }
+die() { warn "ОШИБКА: $*"; exit 1; }
+
+cleanup() {
+    [ "$LOCK_OWNED" = "1" ] && rm -f "$LOCK_FILE"
+    rm -f "$TMP_LIST" "$TMP_SETTINGS" "$TMP_STATE"
+    return 0
+}
 
 # ---------------------------------------------------------------------------
 # Preconditions
@@ -52,16 +76,19 @@ command -v jq >/dev/null 2>&1 || die "не найден jq (opkg install jq)"
 command -v ndmc >/dev/null 2>&1 || die "не найден ndmc"
 
 # Stale-lock aware locking: store PID, verify liveness on collision.
+# ВАЖНО: trap ставится только ПОСЛЕ захвата lock — иначе выход по
+# "скрипт уже выполняется" удалил бы lock чужого работающего процесса.
 if [ -e "$LOCK_FILE" ]; then
     old_pid="$(cat "$LOCK_FILE" 2>/dev/null)"
     if [ -n "$old_pid" ] && kill -0 "$old_pid" 2>/dev/null; then
         die "скрипт уже выполняется (pid $old_pid)"
-    else
-        say "Найден протухший lock-файл (pid $old_pid не активен) — снимаю."
-        rm -f "$LOCK_FILE"
     fi
+    say "Найден протухший lock-файл (pid ${old_pid:-?} не активен) — снимаю."
+    rm -f "$LOCK_FILE"
 fi
-printf '%s\n' "$$" > "$LOCK_FILE"
+printf '%s\n' "$$" > "$LOCK_FILE" || die "не удалось создать $LOCK_FILE"
+LOCK_OWNED=1
+trap cleanup EXIT INT TERM
 
 # Этот скрипт не устанавливает и не обновляет AWG Manager — это отдельная
 # задача. Здесь только проверка, что пакет установлен и рабочий.
@@ -74,8 +101,60 @@ fi
 
 jq empty "$AWG_SETTINGS" 2>/dev/null || die "$AWG_SETTINGS повреждён (невалидный JSON)"
 
-ndmc_cmd() {
-    ndmc -c "$1" 2>/dev/null
+# ---------------------------------------------------------------------------
+# ndmc wrappers
+#
+# Раньше здесь было `ndmc -c "$1" 2>/dev/null` без проверки кода возврата:
+# при недоступном CLI скрипт получал пустой вывод, считал, что WireGuard
+# нет, и молча возвращался в меню. Теперь ошибка видна.
+# ---------------------------------------------------------------------------
+
+ndmc_run() {
+    _cmd="$1"
+    _quiet="${2:-}"
+
+    _out="$(ndmc -c "$_cmd" 2>&1)"
+    _rc=$?
+
+    # ndmc может завершиться с кодом 0, напечатав диагностику ndm.
+    case "$_out" in
+        *'failed to initialize'*|*'ndmc: system failed'*|*'Cli::Main'*) _rc=1 ;;
+    esac
+
+    if [ "$_rc" -ne 0 ]; then
+        [ -n "$_quiet" ] || warn "ndmc: $_out"
+        return 1
+    fi
+
+    printf '%s\n' "$_out"
+    return 0
+}
+
+ndmc_cmd() { ndmc_run "$1"; }
+ndmc_try() { ndmc_run "$1" quiet; }
+
+ndmc_preflight() {
+    if ! _ver="$(ndmc_try 'show version')"; then
+        say ""
+        say "Keenetic CLI недоступен — ndmc не отвечает:"
+        ndmc -c "show version" 2>&1 | sed 's/^/  /'
+        say ""
+        say "Что проверить:"
+        say "  1. Слот CLI занят другой сессией. Закрой веб-интерфейс роутера"
+        say "     и лишние telnet/SSH-сессии, затем повтори."
+        say "     Текущие сессии: ps w | grep '[n]dmc'"
+        say "  2. Если вход был по telnet с логин-шеллом ndmc, этот ndmc держит"
+        say "     слот. Запусти скрипт из отдельной сессии (dropbear из Entware)."
+        say "  3. Служба ndm запущена: ps w | grep '[n]dm'"
+        return 1
+    fi
+
+    if printf '%s' "$_ver" | jq empty 2>/dev/null; then
+        NDMC_FORMAT="json"
+    else
+        NDMC_FORMAT="text"
+    fi
+    return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -97,76 +176,106 @@ interface_present() {
         "$AWG_SETTINGS" >/dev/null 2>&1
 }
 
-# Atomically add an interface to .server.interfaces (no-op if present).
+# Атомарная подмена settings.json: временный файл лежит в том же каталоге,
+# поэтому mv — переименование в пределах ФС, а не copy+unlink.
+# Права оригинала сохраняются.
+commit_settings() {
+    _new="$1"
+
+    [ -s "$_new" ] || { warn "пустой результат jq"; return 1; }
+    jq empty "$_new" 2>/dev/null || { warn "jq сгенерировал невалидный JSON"; return 1; }
+
+    _mode="$(stat -c '%a' "$AWG_SETTINGS" 2>/dev/null)"
+    case "$_mode" in
+        ''|*[!0-7]*) _mode=600 ;;
+    esac
+    chmod "$_mode" "$_new" 2>/dev/null
+
+    mv "$_new" "$AWG_SETTINGS" || { warn "не удалось сохранить settings.json"; return 1; }
+    return 0
+}
+
 add_interface_to_awg() {
     linux="$1"
 
-    if interface_present "$linux"; then
-        return 0
-    fi
+    interface_present "$linux" && return 0
 
-    tmp="/tmp/awg-settings.$$.json"
     jq --arg i "$linux" \
        '.server.interfaces = ((.server.interfaces // []) + [$i] | unique)' \
-       "$AWG_SETTINGS" > "$tmp" 2>/dev/null
+       "$AWG_SETTINGS" > "$TMP_SETTINGS" 2>/dev/null
 
-    [ -s "$tmp" ] || { rm -f "$tmp"; die "jq вернул пустой результат при добавлении $linux"; }
-    jq empty "$tmp" 2>/dev/null || { rm -f "$tmp"; die "jq сгенерировал невалидный JSON"; }
-
-    if ! jq -e --arg i "$linux" '.server.interfaces | index($i) != null' "$tmp" >/dev/null 2>&1; then
-        rm -f "$tmp"
-        die "не удалось добавить $linux в .server.interfaces"
+    if ! jq -e --arg i "$linux" '.server.interfaces | index($i) != null' \
+            "$TMP_SETTINGS" >/dev/null 2>&1; then
+        rm -f "$TMP_SETTINGS"
+        warn "не удалось добавить $linux в .server.interfaces"
+        return 1
     fi
 
-    mv "$tmp" "$AWG_SETTINGS" || die "не удалось сохранить settings.json"
+    commit_settings "$TMP_SETTINGS" || { rm -f "$TMP_SETTINGS"; return 1; }
+    return 0
 }
 
-# Atomically remove an interface from .server.interfaces (no-op if absent).
 remove_interface_from_awg() {
     linux="$1"
 
     interface_present "$linux" || return 0
 
-    tmp="/tmp/awg-settings.$$.json"
     jq --arg i "$linux" \
        '.server.interfaces = ((.server.interfaces // []) - [$i])' \
-       "$AWG_SETTINGS" > "$tmp" 2>/dev/null
+       "$AWG_SETTINGS" > "$TMP_SETTINGS" 2>/dev/null
 
-    [ -s "$tmp" ] || { rm -f "$tmp"; die "jq вернул пустой результат при удалении $linux"; }
-    jq empty "$tmp" 2>/dev/null || { rm -f "$tmp"; die "jq сгенерировал невалидный JSON"; }
-
-    mv "$tmp" "$AWG_SETTINGS" || die "не удалось сохранить settings.json"
+    commit_settings "$TMP_SETTINGS" || { rm -f "$TMP_SETTINGS"; return 1; }
+    return 0
 }
 
 # ---------------------------------------------------------------------------
 # WireGuard interface discovery (Keenetic CLI side)
 # ---------------------------------------------------------------------------
 
+# Оба парсера печатают 5 полей через TAB: ip, desc, sec, state, link.
+# Пустые значения заменяются на "-": при разборе строки через IFS=TAB
+# пустые поля схлопываются (TAB — whitespace для field splitting).
+
+parse_wg_json() {
+    printf '%s' "$1" | jq -r '
+        def d: if . == null or . == "" then "-" else . end;
+        if ((.type // "") | ascii_downcase) == "wireguard" then
+            [ (.address | d),
+              (.description | d),
+              (."security-level" | d),
+              (.state | d),
+              (.link | d) ] | @tsv
+        else empty end' 2>/dev/null
+}
+
+parse_wg_text() {
+    _o="$1"
+
+    printf '%s' "$_o" | grep -qi 'type:[[:space:]]*wireguard' || return 1
+
+    _ip="$(printf '%s' "$_o" | sed -n 's/^[[:space:]]*address:[[:space:]]*\([^[:space:]]*\).*/\1/p' | head -n 1)"
+    _desc="$(printf '%s' "$_o" | sed -n 's/^[[:space:]]*description:[[:space:]]*\(.*\)$/\1/p' | head -n 1 | tr '\t' ' ')"
+    _sec="$(printf '%s' "$_o" | sed -n 's/^[[:space:]]*security-level:[[:space:]]*\([^[:space:]]*\).*/\1/p' | head -n 1)"
+    _state="$(printf '%s' "$_o" | sed -n 's/^[[:space:]]*state:[[:space:]]*\([^[:space:]]*\).*/\1/p' | head -n 1)"
+    _link="$(printf '%s' "$_o" | sed -n 's/^[[:space:]]*link:[[:space:]]*\([^[:space:]]*\).*/\1/p' | head -n 1)"
+
+    printf '%s\t%s\t%s\t%s\t%s\n' \
+        "${_ip:--}" "${_desc:--}" "${_sec:--}" "${_state:--}" "${_link:--}"
+    return 0
+}
+
 list_wg_interfaces() {
-    i=0
-    while [ "$i" -lt 64 ]; do
-        out="$(ndmc_cmd "show interface Wireguard$i")"
-        echo "$out" | grep -q 'type: Wireguard' || {
-            i=$((i + 1))
-            continue
-        }
-
-        ip="$(echo "$out" | sed -n 's/^[[:space:]]*address:[[:space:]]*\([^[:space:]]*\).*/\1/p' | head -n 1)"
-        desc="$(echo "$out" | sed -n 's/^[[:space:]]*description:[[:space:]]*\(.*\)$/\1/p' | head -n 1)"
-        sec="$(echo "$out" | sed -n 's/^[[:space:]]*security-level:[[:space:]]*\([^[:space:]]*\).*/\1/p' | head -n 1)"
-        state="$(echo "$out" | sed -n 's/^[[:space:]]*state:[[:space:]]*\([^[:space:]]*\).*/\1/p' | head -n 1)"
-        link="$(echo "$out" | sed -n 's/^[[:space:]]*link:[[:space:]]*\([^[:space:]]*\).*/\1/p' | head -n 1)"
-
-        [ -n "$ip" ] || ip="-"
-        [ -n "$desc" ] || desc="-"
-        [ -n "$sec" ] || sec="-"
-        [ -n "$state" ] || state="-"
-        [ -n "$link" ] || link="-"
-
-        printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
-            "Wireguard$i" "$ip" "$desc" "$sec" "$state" "$link"
-
-        i=$((i + 1))
+    _i=0
+    while [ "$_i" -le "$MAX_WG_INDEX" ]; do
+        if _out="$(ndmc_try "show interface Wireguard$_i")" && [ -n "$_out" ]; then
+            if [ "$NDMC_FORMAT" = "json" ]; then
+                _fields="$(parse_wg_json "$_out")"
+            else
+                _fields="$(parse_wg_text "$_out")"
+            fi
+            [ -n "$_fields" ] && printf 'Wireguard%s\t%s\n' "$_i" "$_fields"
+        fi
+        _i=$((_i + 1))
     done
 }
 
@@ -181,56 +290,53 @@ get_linux_name() {
 }
 
 show_wg_list() {
-    TMP="/tmp/awg-wg-list.$$"
-    list_wg_interfaces > "$TMP"
-    if [ ! -s "$TMP" ]; then
-        rm -f "$TMP"
-        say "WireGuard-интерфейсы не найдены."
+    say ""
+    say "Опрашиваю Keenetic CLI..."
+    list_wg_interfaces > "$TMP_LIST"
+
+    if [ ! -s "$TMP_LIST" ]; then
+        say "WireGuard-интерфейсы не найдены (Wireguard0-$MAX_WG_INDEX)."
         return 1
     fi
 
     say ""
     say "WireGuard:"
-    while IFS="$(printf '\t')" read -r name ip desc sec state link; do
+    while IFS='	' read -r name ip desc sec state link; do
         printf '  %-11s %-15s %-9s %s (%s/%s)\n' "$name" "$ip" "$sec" "$desc" "$state" "$link"
-    done < "$TMP"
-    rm -f "$TMP"
+    done < "$TMP_LIST"
+    return 0
 }
 
+# 0 — выбран интерфейс, 1 — отмена/неверный ввод, 2 — интерфейсов нет
 select_wg() {
-    TMP="/tmp/awg-wg-list.$$"
-    list_wg_interfaces > "$TMP"
-    [ -s "$TMP" ] || {
-        rm -f "$TMP"
-        return 1
-    }
+    say ""
+    say "Опрашиваю Keenetic CLI..."
+    list_wg_interfaces > "$TMP_LIST"
+    [ -s "$TMP_LIST" ] || return 2
 
     say ""
     say "Выберите WireGuard:"
     say ""
     n=1
-    while IFS="$(printf '\t')" read -r name ip desc sec state link; do
-        printf '%s) %s — %s — %s\n' "$n" "$name" "$ip" "$desc"
+    while IFS='	' read -r name ip desc sec state link; do
+        printf '%s) %s — %s — %s (%s/%s)\n' "$n" "$name" "$ip" "$desc" "$state" "$link"
         n=$((n + 1))
-    done < "$TMP"
+    done < "$TMP_LIST"
 
     printf "Выбор [1-%s, 0=отмена]: " "$((n - 1))"
-    read choice
+    read -r choice
 
     case "$choice" in
-        0|"") rm -f "$TMP"; return 1 ;;
+        0|"") return 1 ;;
+        *[!0-9]*) say "Неверный ввод."; return 1 ;;
     esac
 
-    case "$choice" in
-        *[!0-9]*) rm -f "$TMP"; return 1 ;;
-    esac
-
-    selected="$(sed -n "${choice}p" "$TMP")"
-    rm -f "$TMP"
-    [ -n "$selected" ] || return 1
+    selected="$(sed -n "${choice}p" "$TMP_LIST")"
+    [ -n "$selected" ] || { say "Нет пункта $choice."; return 1; }
 
     OLD_IFS="$IFS"
-    IFS="$(printf '\t')"
+    IFS='	'
+    # shellcheck disable=SC2086
     set -- $selected
     IFS="$OLD_IFS"
 
@@ -261,10 +367,10 @@ ensure_backup() {
             say "Это состояние будет сохранено как точка отката (\"исходное\")."
             say "Если это не так — сначала поправь settings.json/security-level вручную."
             printf "Продолжить и считать текущее состояние исходным? [y/N]: "
-            read confirm_extra
+            read -r confirm_extra
             case "$confirm_extra" in
                 y|Y|д|Д) ;;
-                *) die "Отменено пользователем." ;;
+                *) say "Отменено."; return 1 ;;
             esac
         fi
         cp -p "$AWG_SETTINGS" "$FULL_SETTINGS" || die "не удалось сохранить settings.json"
@@ -274,25 +380,31 @@ ensure_backup() {
 
     if ! grep -q "^$SEL_NAME	" "$STATE_FILE" 2>/dev/null; then
         # Append atomically: write to tmp, then replace.
-        tmp="/tmp/awg-state.$$.tsv"
-        cp -p "$STATE_FILE" "$tmp" 2>/dev/null || : > "$tmp"
+        cp -p "$STATE_FILE" "$TMP_STATE" 2>/dev/null || : > "$TMP_STATE"
         printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
             "$SEL_NAME" "$SEL_IP" "$SEL_SEC" "$SEL_LINUX" "$SEL_DESC" \
-            "$(date '+%Y-%m-%d %H:%M:%S')" >> "$tmp"
-        mv "$tmp" "$STATE_FILE" || die "не удалось обновить $STATE_FILE"
+            "$(date '+%Y-%m-%d %H:%M:%S')" >> "$TMP_STATE"
+        mv "$TMP_STATE" "$STATE_FILE" || die "не удалось обновить $STATE_FILE"
     fi
+    return 0
 }
 
 set_security_level() {
     iface="$1"
     level="$2"
-    ndmc_cmd "interface $iface security-level $level" >/dev/null || \
-        die "не удалось установить security-level $level для $iface"
+    ndmc_cmd "interface $iface security-level $level" >/dev/null || {
+        warn "не удалось установить security-level $level для $iface"
+        return 1
+    }
+    return 0
 }
 
 save_keenetic() {
-    ndmc_cmd "system configuration save" >/dev/null || \
-        die "не удалось сохранить конфигурацию Keenetic"
+    ndmc_cmd "system configuration save" >/dev/null || {
+        warn "не удалось сохранить конфигурацию Keenetic"
+        return 1
+    }
+    return 0
 }
 
 restart_awg() {
@@ -303,38 +415,44 @@ restart_awg() {
     return 0
 }
 
+# Совпадением считается и конкретный адрес, и wildcard (0.0.0.0 / :: / *),
+# на котором демон слушает все интерфейсы.
 port_is_listening() {
-    ipaddr="$1"
-    port="$2"
-    netstat -lnpt 2>/dev/null | grep -q "${ipaddr}:${port}[[:space:]]"
+    _ip="$1"
+    _port="$2"
+
+    netstat -lnt 2>/dev/null | awk -v ip="$_ip" -v p="$_port" '
+        $1 ~ /^tcp/ {
+            n = split($4, a, ":")
+            if (n < 2) next
+            addr = ""
+            for (i = 1; i < n; i++) addr = addr (i > 1 ? ":" : "") a[i]
+            if (a[n] == p && (addr == ip || addr == "0.0.0.0" || addr == "::" || addr == "*"))
+                found = 1
+        }
+        END { exit !found }'
 }
 
-# Ждёт до $max_wait секунд, пока AWG Manager не начнёт слушать порт.
-# После рестарта демону нужно время на инициализацию — мгновенная
-# однократная проверка часто ловит ложное "не найдено".
+# Ждёт до $PORT_WAIT_SECONDS, пока AWG Manager не начнёт слушать порт:
+# после рестарта демону нужно время на инициализацию.
 wait_for_port() {
-    ipaddr="$1"
-    port="$2"
-    max_wait=10
+    _ip="$1"
+    _port="$2"
 
-    if ! command -v netstat >/dev/null 2>&1; then
+    command -v netstat >/dev/null 2>&1 || {
         say "ПРЕДУПРЕЖДЕНИЕ: netstat недоступен, проверка порта пропущена."
         return 2
-    fi
+    }
 
     say "Проверка порта..."
-    elapsed=0
-    while [ "$elapsed" -lt "$max_wait" ]; do
-        if port_is_listening "$ipaddr" "$port"; then
-            return 0
-        fi
-        elapsed=$((elapsed + 1))
-        say "  $elapsed секунд..."
+    _elapsed=0
+    while [ "$_elapsed" -lt "$PORT_WAIT_SECONDS" ]; do
+        port_is_listening "$_ip" "$_port" && return 0
+        _elapsed=$((_elapsed + 1))
         sleep 1
     done
 
-    port_is_listening "$ipaddr" "$port" && return 0
-    return 1
+    port_is_listening "$_ip" "$_port"
 }
 
 # ---------------------------------------------------------------------------
@@ -342,7 +460,15 @@ wait_for_port() {
 # ---------------------------------------------------------------------------
 
 configure_access() {
-    select_wg || return 0
+    select_wg
+    case "$?" in
+        1) return 0 ;;
+        2) say ""
+           say "WireGuard-интерфейсы не найдены."
+           say "ndmc отвечает, но ни один Wireguard0-$MAX_WG_INDEX не вернул type: Wireguard."
+           say "Проверь вручную: ndmc -c \"show interface Wireguard0\""
+           return 1 ;;
+    esac
 
     [ "$SEL_IP" != "-" ] || {
         say "У выбранного интерфейса нет IPv4-адреса."
@@ -354,6 +480,8 @@ configure_access() {
         return 1
     }
 
+    port="$(get_server_port)"
+
     say ""
     say "Выбран:"
     say "  Интерфейс: $SEL_NAME"
@@ -362,39 +490,52 @@ configure_access() {
     say "  Было:      security-level $SEL_SEC"
     say "  Linux:     $SEL_LINUX"
     say ""
+    say "security-level private снимает изоляцию интерфейса целиком, а не"
+    say "только порт $port: с той стороны туннеля станут доступны все службы,"
+    say "слушающие на 0.0.0.0. После настройки проверь: netstat -lnt"
+    say ""
 
     printf "Продолжить? [y/N]: "
-    read answer
+    read -r answer
     case "$answer" in
         y|Y|д|Д) ;;
         *) say "Отменено."; return 0 ;;
     esac
 
-    ensure_backup
+    ensure_backup || return 1
 
-    # Backup current settings too, for diagnostics.
-    cp -p "$AWG_SETTINGS" "$BACKUP_ROOT/settings.before.$SEL_NAME.json" 2>/dev/null
+    # Снимок непосредственно перед изменением — нужен для отката шага 1,
+    # если шаг 2 не выполнится.
+    before="$BACKUP_ROOT/settings.before.$SEL_NAME.json"
+    cp -p "$AWG_SETTINGS" "$before" 2>/dev/null
 
     say "[1/4] Добавляю $SEL_LINUX в AWG Manager (.server.interfaces)..."
-    add_interface_to_awg "$SEL_LINUX"
+    add_interface_to_awg "$SEL_LINUX" || return 1
 
     say "[2/4] Устанавливаю $SEL_NAME = private..."
-    set_security_level "$SEL_NAME" "private"
+    if ! set_security_level "$SEL_NAME" "private"; then
+        say "Откатываю изменение settings.json..."
+        if [ -f "$before" ] && cp -p "$before" "$AWG_SETTINGS"; then
+            say "settings.json возвращён к состоянию до запуска."
+        else
+            say "ВНИМАНИЕ: откат settings.json не удался, проверь $AWG_SETTINGS"
+        fi
+        return 1
+    fi
 
     say "[3/4] Сохраняю конфигурацию Keenetic..."
-    save_keenetic
+    save_keenetic || say "ПРЕДУПРЕЖДЕНИЕ: конфигурация не сохранена, изменения пропадут после перезагрузки."
 
     say "[4/4] Перезапускаю AWG Manager..."
     restart_awg
 
-    port="$(get_server_port)"
     say ""
     wait_for_port "$SEL_IP" "$port"
     case "$?" in
-        0) say "OK: AWG Manager слушает $SEL_IP:$port" ;;
-        1) say "ПРЕДУПРЕЖДЕНИЕ: $SEL_IP:$port не обнаружен в LISTEN за 10 секунд."
-           say "Проверь: netstat -lnpt | grep $port" ;;
-        2) : ;; # already warned inside wait_for_port
+        0) say "OK: AWG Manager слушает порт $port" ;;
+        1) say "ПРЕДУПРЕЖДЕНИЕ: порт $port не обнаружен в LISTEN за $PORT_WAIT_SECONDS секунд."
+           say "Проверь: netstat -lnt | grep $port" ;;
+        2) : ;;  # already warned inside wait_for_port
     esac
 
     say ""
@@ -404,6 +545,7 @@ configure_access() {
     say "Точка отката сохранена в:"
     say "  $FULL_SETTINGS"
     say "  $STATE_FILE"
+    return 0
 }
 
 restore_all() {
@@ -419,7 +561,7 @@ restore_all() {
     say ""
 
     printf "ТОЧНО вернуть всё как было? [y/N]: "
-    read answer
+    read -r answer
     case "$answer" in
         y|Y|д|Д) ;;
         *) say "Отменено."; return 0 ;;
@@ -436,40 +578,45 @@ restore_all() {
 
     # Restore exact original security levels.
     if [ -f "$STATE_FILE" ]; then
-        while IFS="$(printf '\t')" read -r iface ip oldsec linux desc timestamp; do
+        while IFS='	' read -r iface ip oldsec linux desc timestamp; do
             [ -n "$iface" ] || continue
             [ -n "$oldsec" ] || continue
+            [ "$oldsec" != "-" ] || {
+                say "[!] $iface: исходный security-level неизвестен, пропускаю"
+                fail_count=$((fail_count + 1))
+                continue
+            }
 
             say "[+] $iface -> security-level $oldsec"
-            if ! ndmc_cmd "interface $iface security-level $oldsec" >/dev/null; then
-                say "    ПРЕДУПРЕЖДЕНИЕ: не удалось восстановить $iface"
+            if ! set_security_level "$iface" "$oldsec"; then
                 fail_count=$((fail_count + 1))
             fi
         done < "$STATE_FILE"
     fi
 
     say "[+] Сохраняю конфигурацию Keenetic..."
-    save_keenetic
+    save_keenetic || fail_count=$((fail_count + 1))
 
     say "[+] Перезапускаю AWG Manager..."
     restart_awg
 
     say ""
     if [ "$fail_count" -gt 0 ]; then
-        say "Откат завершён С ОШИБКАМИ ($fail_count интерфейс(ов) не восстановлены)."
+        say "Откат завершён С ОШИБКАМИ ($fail_count шаг(ов) не выполнены)."
         say "Проверь вручную: ndmc -c \"show interface WireguardN\""
         say "Резервная копия НЕ удалена (нужна для повторной попытки):"
         say "  $BACKUP_ROOT"
-    else
-        say "Откат завершён."
-        # Полный успех: точка отката больше не актуальна для будущих
-        # запусков — снимаем её, чтобы следующий configure_access() снял
-        # свежий снапшот текущего (уже восстановленного) состояния, а не
-        # унаследовал точку отката от самого первого запуска скрипта.
-        rm -f "$FULL_SETTINGS" "$STATE_FILE"
-        rm -f "$BACKUP_ROOT"/settings.before.*.json 2>/dev/null
-        say "Точка отката снята — при следующей настройке будет создана заново."
+        return 1
     fi
+
+    say "Откат завершён."
+    # Полный успех: точка отката больше не актуальна для будущих запусков —
+    # снимаем её, чтобы следующий configure_access() снял свежий снапшот
+    # текущего (уже восстановленного) состояния.
+    rm -f "$FULL_SETTINGS" "$STATE_FILE"
+    rm -f "$BACKUP_ROOT"/settings.before.*.json 2>/dev/null
+    say "Точка отката снята — при следующей настройке будет создана заново."
+    return 0
 }
 
 show_status() {
@@ -483,7 +630,7 @@ show_status() {
     say "AWG Manager: порт $port, interfaces $(jq -c '.server.interfaces' "$AWG_SETTINGS" 2>/dev/null)"
 
     if command -v netstat >/dev/null 2>&1; then
-        listen="$(netstat -lnpt 2>/dev/null | awk -v p=":$port" '$4 ~ p"$" {print $4}')"
+        listen="$(netstat -lnt 2>/dev/null | awk -v p=":$port" '$4 ~ p"$" {print $4}')"
         if [ -n "$listen" ]; then
             say "  LISTEN: $(printf '%s' "$listen" | tr '\n' ' ')"
         else
@@ -497,13 +644,14 @@ show_status() {
     if [ -f "$STATE_FILE" ]; then
         say "Точка отката: $BACKUP_ROOT"
         say "Изменённые интерфейсы:"
-        while IFS="$(printf '\t')" read -r iface ip oldsec linux desc ts; do
+        while IFS='	' read -r iface ip oldsec linux desc ts; do
             [ -n "$iface" ] || continue
             printf '  %-11s было: %-8s %s (%s)\n' "$iface" "$oldsec" "$linux" "$ts"
         done < "$STATE_FILE"
     else
         say "Точка отката отсутствует."
     fi
+    return 0
 }
 
 menu() {
@@ -520,7 +668,7 @@ menu() {
         say ""
 
         printf "Выберите [0-3]: "
-        read choice
+        read -r choice || exit 0
 
         case "$choice" in
             1) configure_access ;;
@@ -531,5 +679,7 @@ menu() {
         esac
     done
 }
+
+ndmc_preflight || die "Keenetic CLI недоступен — настройка невозможна"
 
 menu
